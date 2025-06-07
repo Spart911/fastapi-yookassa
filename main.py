@@ -1,8 +1,9 @@
 import os
 import uuid
-from typing import List
-from fastapi import FastAPI, HTTPException, Depends
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, JSON
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
@@ -15,6 +16,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging
+import ipaddress
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +48,17 @@ yookassa.Configuration.configure(
 # Настройка Telegram
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# Список разрешенных IP-адресов ЮKassa
+YOOKASSA_IPS = [
+    ipaddress.ip_network('185.71.76.0/27'),
+    ipaddress.ip_network('185.71.77.0/27'),
+    ipaddress.ip_network('77.75.153.0/25'),
+    ipaddress.ip_network('77.75.156.11/32'),
+    ipaddress.ip_network('77.75.156.35/32'),
+    ipaddress.ip_network('77.75.154.128/25'),
+    ipaddress.ip_network('2a02:5180::/32')
+]
 
 # Настройка базы данных
 SQLALCHEMY_DATABASE_URL = "sqlite:///./orders.db"
@@ -89,6 +102,11 @@ class OrderCreate(BaseModel):
     order_time: str
     items: List[OrderItem]
     total_amount: float
+
+class YooKassaNotification(BaseModel):
+    type: str
+    event: str
+    object: dict
 
 # Dependency для получения сессии БД
 async def get_db():
@@ -138,6 +156,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def is_yookassa_ip(ip: str) -> bool:
+    """Проверяет, принадлежит ли IP-адрес ЮKassa"""
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return any(ip_obj in network for network in YOOKASSA_IPS)
+    except ValueError:
+        return False
+
 @app.get("/")
 async def root():
     return {
@@ -176,8 +202,7 @@ async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
                 "currency": "RUB"
             },
             "confirmation": {
-                "type": "redirect",
-                "return_url": "https://myshop.com/payment_success"
+                "type": "embedded"  # Изменено на embedded для виджета
             },
             "capture": True,
             "description": f"Заказ №{db_order.id}"
@@ -191,70 +216,97 @@ async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
 
         return {
             "order_id": db_order.id,
-            "payment_url": payment.confirmation.confirmation_url
+            "confirmation_token": payment.confirmation.confirmation_token
         }
     except Exception as e:
         db.rollback()
         logger.error(f"Error creating order: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/payment_success")
-async def payment_success(payment_id: str, db: Session = Depends(get_db)):
+@app.post("/webhook")
+async def yookassa_webhook(request: Request, db: Session = Depends(get_db)):
     try:
-        # Получение информации о платеже
-        payment = yookassa.Payment.find_one(payment_id)
+        # Проверка IP-адреса
+        client_ip = request.client.host
+        if not is_yookassa_ip(client_ip):
+            logger.warning(f"Received webhook from unauthorized IP: {client_ip}")
+            raise HTTPException(status_code=403, detail="Unauthorized IP")
+
+        # Получение данных уведомления
+        notification_data = await request.json()
+        notification = YooKassaNotification(**notification_data)
         
-        if payment.status == "succeeded":
-            # Обновление статуса заказа
-            order = db.query(Order).filter(Order.payment_id == payment_id).first()
-            if order:
-                order.status = "paid"
-                db.commit()
+        # Проверка типа уведомления
+        if notification.type != "notification":
+            raise HTTPException(status_code=400, detail="Invalid notification type")
 
-                # Формируем подробное сообщение для Telegram
-                items_text = "\n".join([f"- {item['name']} x{item['quantity']}" for item in order.items])
-                message = (
-                    f"✅ Оплачен заказ №{order.id}\n\n"
-                    f"💰 Сумма: {order.total_amount} руб.\n"
-                    f"📧 Email: {order.email}\n"
-                    f"📱 Телефон: {order.phone}\n"
-                    f"📍 Адрес: {order.address}\n"
-                    f"🕒 Время доставки: {order.delivery_time}\n\n"
-                    f"📋 Состав заказа:\n{items_text}"
-                )
-                
-                # Отправка уведомления в Telegram
-                if telegram_bot:
-                    try:
-                        await telegram_bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=message,
-                            parse_mode='HTML'
-                        )
-                        logger.info(f"Telegram notification sent for order {order.id}")
-                    except Exception as e:
-                        logger.error(f"Failed to send Telegram notification: {e}")
-
-                return {
-                    "status": "success",
-                    "message": "Заказ успешно оплачен",
-                    "order_id": order.id
-                }
-            else:
-                raise HTTPException(status_code=404, detail="Заказ не найден")
-        elif payment.status == "waiting_for_capture":
-            return {
-                "status": "waiting",
-                "message": "Платеж ожидает подтверждения"
-            }
-        elif payment.status == "canceled":
-            raise HTTPException(status_code=400, detail="Платеж отменен")
-        else:
-            raise HTTPException(status_code=400, detail=f"Неизвестный статус платежа: {payment.status}")
+        # Обработка различных событий
+        if notification.event == "payment.succeeded":
+            payment = notification.object
+            order = db.query(Order).filter(Order.payment_id == payment["id"]).first()
             
+            if order:
+                # Проверка статуса платежа через API
+                yookassa_payment = yookassa.Payment.find_one(payment["id"])
+                if yookassa_payment.status == "succeeded":
+                    order.status = "paid"
+                    db.commit()
+
+                    # Формируем подробное сообщение для Telegram
+                    items_text = "\n".join([f"- {item['name']} x{item['quantity']}" for item in order.items])
+                    message = (
+                        f"✅ Оплачен заказ №{order.id}\n\n"
+                        f"💰 Сумма: {order.total_amount} руб.\n"
+                        f"📧 Email: {order.email}\n"
+                        f"📱 Телефон: {order.phone}\n"
+                        f"📍 Адрес: {order.address}\n"
+                        f"🕒 Время доставки: {order.delivery_time}\n\n"
+                        f"📋 Состав заказа:\n{items_text}"
+                    )
+                    
+                    # Отправка уведомления в Telegram
+                    if telegram_bot:
+                        try:
+                            await telegram_bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=message,
+                                parse_mode='HTML'
+                            )
+                            logger.info(f"Telegram notification sent for order {order.id}")
+                        except Exception as e:
+                            logger.error(f"Failed to send Telegram notification: {e}")
+
+        elif notification.event == "payment.waiting_for_capture":
+            logger.info(f"Payment {notification.object['id']} waiting for capture")
+            
+        elif notification.event == "payment.canceled":
+            payment = notification.object
+            order = db.query(Order).filter(Order.payment_id == payment["id"]).first()
+            if order:
+                order.status = "canceled"
+                db.commit()
+                logger.info(f"Order {order.id} payment canceled")
+
+        return {"status": "ok"}
+
     except Exception as e:
-        db.rollback()
-        logger.error(f"Error processing payment: {e}")
+        logger.error(f"Error processing webhook: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/order/{order_id}/status")
+async def get_order_status(order_id: int, db: Session = Depends(get_db)):
+    try:
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Заказ не найден")
+        
+        return {
+            "order_id": order.id,
+            "status": order.status,
+            "payment_id": order.payment_id
+        }
+    except Exception as e:
+        logger.error(f"Error getting order status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
