@@ -12,6 +12,9 @@ import yookassa
 from telegram import Bot
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -22,6 +25,17 @@ PORT = int(os.getenv("PORT", 10000))
 # Настройка ЮKassa
 yookassa.Configuration.account_id = os.getenv('YOOKASSA_SHOP_ID')
 yookassa.Configuration.secret_key = os.getenv('YOOKASSA_API_KEY')
+
+# Настройка сессии requests для ЮKassa
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+yookassa.Configuration.configure(session=session)
 
 # Настройка Telegram
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -119,66 +133,76 @@ async def root():
 
 @app.post("/order")
 async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
-    # Преобразуем items в список словарей
-    items_data = [item.dict() for item in order.items]
-    
-    # Создание заказа в базе данных
-    db_order = Order(
-        email=order.email,
-        phone=order.phone,
-        address=order.address,
-        delivery_time=order.delivery_time,
-        order_time=order.order_time,
-        items=items_data,
-        total_amount=order.total_amount
-    )
-    db.add(db_order)
-    db.commit()
-    db.refresh(db_order)
+    try:
+        # Преобразуем items в список словарей
+        items_data = [item.dict() for item in order.items]
+        
+        # Создание заказа в базе данных
+        db_order = Order(
+            email=order.email,
+            phone=order.phone,
+            address=order.address,
+            delivery_time=order.delivery_time,
+            order_time=order.order_time,
+            items=items_data,
+            total_amount=order.total_amount
+        )
+        db.add(db_order)
+        db.commit()
+        db.refresh(db_order)
 
-    # Создание платежа в ЮKassa
-    idempotence_key = str(uuid.uuid4())
-    payment = yookassa.Payment.create({
-        "amount": {
-            "value": str(order.total_amount),
-            "currency": "RUB"
-        },
-        "confirmation": {
-            "type": "redirect",
-            "return_url": "https://myshop.com/payment_success"
-        },
-        "capture": True,
-        "description": f"Заказ №{db_order.id}"
-    }, idempotence_key)
+        # Создание платежа в ЮKassa
+        idempotence_key = str(uuid.uuid4())
+        payment_data = {
+            "amount": {
+                "value": str(order.total_amount),
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": "https://myshop.com/payment_success"
+            },
+            "capture": True,
+            "description": f"Заказ №{db_order.id}"
+        }
 
-    # Обновление заказа с ID платежа
-    db_order.payment_id = payment.id
-    db.commit()
+        payment = yookassa.Payment.create(payment_data, idempotence_key)
 
-    return {
-        "order_id": db_order.id,
-        "payment_url": payment.confirmation.confirmation_url
-    }
+        # Обновление заказа с ID платежа
+        db_order.payment_id = payment.id
+        db.commit()
+
+        return {
+            "order_id": db_order.id,
+            "payment_url": payment.confirmation.confirmation_url
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/payment_success")
 async def payment_success(payment_id: str, db: Session = Depends(get_db)):
-    # Получение информации о платеже
-    payment = yookassa.Payment.find_one(payment_id)
-    
-    if payment.status == "succeeded":
-        # Обновление статуса заказа
-        order = db.query(Order).filter(Order.payment_id == payment_id).first()
-        if order:
-            order.status = "paid"
-            db.commit()
+    try:
+        # Получение информации о платеже
+        payment = yookassa.Payment.find_one(payment_id)
+        
+        if payment.status == "succeeded":
+            # Обновление статуса заказа
+            order = db.query(Order).filter(Order.payment_id == payment_id).first()
+            if order:
+                order.status = "paid"
+                db.commit()
 
-            # Отправка уведомления в Telegram
-            message = f"Оплачен заказ №{order.id}, сумма {order.total_amount} руб."
-            await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                # Отправка уведомления в Telegram
+                message = f"Оплачен заказ №{order.id}, сумма {order.total_amount} руб."
+                await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-            return {"status": "success"}
-    
-    raise HTTPException(status_code=400, detail="Payment not successful")
+                return {"status": "success"}
+        
+        raise HTTPException(status_code=400, detail="Payment not successful")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
