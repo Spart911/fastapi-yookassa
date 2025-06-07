@@ -16,6 +16,9 @@ from contextlib import asynccontextmanager
 # Загрузка переменных окружения
 load_dotenv()
 
+# Получение порта из переменной окружения
+PORT = int(os.getenv("PORT", 10000))
+
 # Настройка ЮKassa
 yookassa.Configuration.account_id = os.getenv('YOOKASSA_SHOP_ID')
 yookassa.Configuration.secret_key = os.getenv('YOOKASSA_API_KEY')
@@ -104,7 +107,8 @@ async def root():
         "status": "ok",
         "message": "API is running",
         "docs_url": "/docs",
-        "redoc_url": "/redoc"
+        "redoc_url": "/redoc",
+        "port": PORT
     }
 
 @app.post("/order")
@@ -165,4 +169,8 @@ async def payment_success(payment_id: str, db: Session = Depends(get_db)):
 
             return {"status": "success"}
     
-    raise HTTPException(status_code=400, detail="Payment not successful") 
+    raise HTTPException(status_code=400, detail="Payment not successful")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT) 
