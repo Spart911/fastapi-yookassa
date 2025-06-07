@@ -1,16 +1,17 @@
 import os
 import uuid
 from typing import List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, JSON
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
 import yookassa
 from telegram import Bot
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -22,11 +23,10 @@ yookassa.Configuration.secret_key = os.getenv('YOOKASSA_API_KEY')
 # Настройка Telegram
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # Настройка базы данных
 SQLALCHEMY_DATABASE_URL = "sqlite:///./orders.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -61,7 +61,28 @@ class OrderCreate(BaseModel):
     items: List[OrderItem]
     total_amount: float
 
-app = FastAPI()
+# Dependency для получения сессии БД
+async def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Инициализация Telegram бота
+telegram_bot = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Инициализация при запуске
+    global telegram_bot
+    telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    yield
+    # Очистка при завершении
+    if telegram_bot:
+        await telegram_bot.close()
+
+app = FastAPI(lifespan=lifespan)
 
 # Настройка CORS
 app.add_middleware(
@@ -73,9 +94,8 @@ app.add_middleware(
 )
 
 @app.post("/order")
-async def create_order(order: OrderCreate):
+async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
     # Создание заказа в базе данных
-    db = SessionLocal()
     db_order = Order(
         email=order.email,
         phone=order.phone,
@@ -114,13 +134,12 @@ async def create_order(order: OrderCreate):
     }
 
 @app.post("/payment_success")
-async def payment_success(payment_id: str):
+async def payment_success(payment_id: str, db: Session = Depends(get_db)):
     # Получение информации о платеже
     payment = yookassa.Payment.find_one(payment_id)
     
     if payment.status == "succeeded":
         # Обновление статуса заказа
-        db = SessionLocal()
         order = db.query(Order).filter(Order.payment_id == payment_id).first()
         if order:
             order.status = "paid"
