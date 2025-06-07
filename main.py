@@ -5,8 +5,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, JSON
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from datetime import datetime
 import yookassa
 from telegram import Bot
@@ -22,10 +21,6 @@ load_dotenv()
 # Получение порта из переменной окружения
 PORT = int(os.getenv("PORT", 10000))
 
-# Настройка ЮKassa
-yookassa.Configuration.account_id = os.getenv('YOOKASSA_SHOP_ID')
-yookassa.Configuration.secret_key = os.getenv('YOOKASSA_API_KEY')
-
 # Настройка сессии requests для ЮKassa
 session = requests.Session()
 retry_strategy = Retry(
@@ -35,7 +30,13 @@ retry_strategy = Retry(
 )
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
-yookassa.Configuration.configure(session=session)
+
+# Настройка ЮKassa
+yookassa.Configuration.configure(
+    account_id=os.getenv('YOOKASSA_SHOP_ID'),
+    secret_key=os.getenv('YOOKASSA_API_KEY'),
+    session=session
+)
 
 # Настройка Telegram
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
