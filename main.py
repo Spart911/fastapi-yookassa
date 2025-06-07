@@ -82,7 +82,12 @@ async def lifespan(app: FastAPI):
     if telegram_bot:
         await telegram_bot.close()
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="FastAPI Order API",
+    description="API для обработки заказов с интеграцией ЮKassa",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 # Настройка CORS
 app.add_middleware(
@@ -95,7 +100,12 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "API is running"}
+    return {
+        "status": "ok",
+        "message": "API is running",
+        "docs_url": "/docs",
+        "redoc_url": "/redoc"
+    }
 
 @app.post("/order")
 async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
