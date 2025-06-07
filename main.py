@@ -14,6 +14,11 @@ from contextlib import asynccontextmanager
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -100,11 +105,22 @@ telegram_bot = None
 async def lifespan(app: FastAPI):
     # Инициализация при запуске
     global telegram_bot
-    telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    try:
+        telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        logger.info("Telegram bot initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Telegram bot: {e}")
+        telegram_bot = None
+    
     yield
+    
     # Очистка при завершении
     if telegram_bot:
-        await telegram_bot.close()
+        try:
+            await telegram_bot.close()
+            logger.info("Telegram bot closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing Telegram bot: {e}")
 
 app = FastAPI(
     title="FastAPI Order API",
@@ -179,6 +195,7 @@ async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
         }
     except Exception as e:
         db.rollback()
+        logger.error(f"Error creating order: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/payment_success")
@@ -194,15 +211,50 @@ async def payment_success(payment_id: str, db: Session = Depends(get_db)):
                 order.status = "paid"
                 db.commit()
 
+                # Формируем подробное сообщение для Telegram
+                items_text = "\n".join([f"- {item['name']} x{item['quantity']}" for item in order.items])
+                message = (
+                    f"✅ Оплачен заказ №{order.id}\n\n"
+                    f"💰 Сумма: {order.total_amount} руб.\n"
+                    f"📧 Email: {order.email}\n"
+                    f"📱 Телефон: {order.phone}\n"
+                    f"📍 Адрес: {order.address}\n"
+                    f"🕒 Время доставки: {order.delivery_time}\n\n"
+                    f"📋 Состав заказа:\n{items_text}"
+                )
+                
                 # Отправка уведомления в Telegram
-                message = f"Оплачен заказ №{order.id}, сумма {order.total_amount} руб."
-                await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                if telegram_bot:
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=message,
+                            parse_mode='HTML'
+                        )
+                        logger.info(f"Telegram notification sent for order {order.id}")
+                    except Exception as e:
+                        logger.error(f"Failed to send Telegram notification: {e}")
 
-                return {"status": "success"}
-        
-        raise HTTPException(status_code=400, detail="Payment not successful")
+                return {
+                    "status": "success",
+                    "message": "Заказ успешно оплачен",
+                    "order_id": order.id
+                }
+            else:
+                raise HTTPException(status_code=404, detail="Заказ не найден")
+        elif payment.status == "waiting_for_capture":
+            return {
+                "status": "waiting",
+                "message": "Платеж ожидает подтверждения"
+            }
+        elif payment.status == "canceled":
+            raise HTTPException(status_code=400, detail="Платеж отменен")
+        else:
+            raise HTTPException(status_code=400, detail=f"Неизвестный статус платежа: {payment.status}")
+            
     except Exception as e:
         db.rollback()
+        logger.error(f"Error processing payment: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
