@@ -55,6 +55,12 @@ class OrderItem(BaseModel):
     name: str
     quantity: int
 
+    def dict(self, *args, **kwargs):
+        return {
+            "name": self.name,
+            "quantity": self.quantity
+        }
+
 class OrderCreate(BaseModel):
     email: EmailStr
     phone: str
@@ -113,6 +119,9 @@ async def root():
 
 @app.post("/order")
 async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
+    # Преобразуем items в список словарей
+    items_data = [item.dict() for item in order.items]
+    
     # Создание заказа в базе данных
     db_order = Order(
         email=order.email,
@@ -120,7 +129,7 @@ async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
         address=order.address,
         delivery_time=order.delivery_time,
         order_time=order.order_time,
-        items=order.items,
+        items=items_data,
         total_amount=order.total_amount
     )
     db.add(db_order)
