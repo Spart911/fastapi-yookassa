@@ -93,6 +93,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "API is running"}
+
 @app.post("/order")
 async def create_order(order: OrderCreate, db: Session = Depends(get_db)):
     # Создание заказа в базе данных
